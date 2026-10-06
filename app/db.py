@@ -7,23 +7,38 @@
   秒数 ``original_seconds`` 与“该位置一个 tick 的时长” ``tick_seconds``
   （锁定偏移阈值）；
 * ``rehearsals``：排练（关联谱例 ID、已领取进度 ``last_elapsed``，
-  只能前进）；
+  只能前进）及当前计时起点（``located`` / ``origin_elapsed`` /
+  ``origin_position`` / ``origin_ticks``；未定位时起点即排练开始
+  1:1:0、秒数 0）；
 * ``rehearsal_cues``：排练提示（位置、文字、创建时按谱例拍号展开的
   tick 坐标——PPQ/拍号不随速度图修订变化，故坐标恒定，只有触发秒数
   随修订重算）；
 * ``cue_deliveries``：发放记录（触发秒数、计算所用的速度图修订号、
   领取时的累计秒数），主键 ``(rehearsal_id, cue_index)`` 兜底保证
-  同一提示最多发放一次。
+  同一提示最多发放一次；
+* ``cue_skips``：定位跳过记录（仅记录定位时位于目标位置之前的**未发**
+  提示），与发放记录互斥：跳过的提示永不发放，已发提示永不改记跳过，
+  回跳也不恢复跳过状态。
+
+定位（跳转）是单事务：``BEGIN IMMEDIATE`` 后校验提交秒数恰为当前
+已领取进度（不等即拒绝、状态不变），把目标位置之前的未发提示写入
+``cue_skips``，并以（该秒数, 目标位置, 目标 tick）更新计时起点；
+此后未发提示的触发秒数 = 定位秒数 + 按当前已提交速度图算出的
+“目标 -> 提示”时长，故**目标处的提示可在同一秒领取**。回跳不重发
+已发提示、不恢复已跳过提示。发布只更新速度图：待发提示按新修订重新
+计时，已发记录、跳过状态与定位起点均不变。
 
 发布是单事务：``BEGIN IMMEDIATE`` 取得写锁后按 revision 做乐观并发控制
 （预期修订号不匹配 -> 409），成功则一次更新速度图、未锁定锚点秒数和
 修订号，锁定锚点秒数不变。进程内再用一把锁串行化写事务。
 
 领取也是单事务：``BEGIN IMMEDIATE`` 后在同一快照内读出谱例当前已提交
-的速度图与修订号，对未发提示计算触发秒数、写入发放记录并推进领取进度。
-与发布交错时二者必居其一（读到完整的旧修订或完整的新修订），因此
-**计算到点所用的修订号必然等于写入发放记录的修订号**；并发领取被
-进程内写锁与 SQLite 写锁串行化，同一提示最多发放一次。
+的速度图与修订号，对未发且未跳过的提示，按当前计时起点（定位起点或
+排练开始）计算触发秒数、写入发放记录并推进领取进度。与发布交错时二者
+必居其一（读到完整的旧修订或完整的新修订），因此
+**计算到点所用的修订号必然等于写入发放记录的修订号**；并发领取/定位
+被进程内写锁与 SQLite 写锁串行化，发放记录与跳过记录互斥，
+同一提示最多发放一次、也不可能既跳过又发放。
 
 查询同样是单事务：``GET /scores`` / ``GET /rehearsals`` 在同一显式读
 事务内读取主行与全部明细行，二者共用一个已提交快照，避免与发布/领取
@@ -63,10 +78,14 @@ CREATE TABLE IF NOT EXISTS anchors (
 );
 
 CREATE TABLE IF NOT EXISTS rehearsals (
-    id           TEXT PRIMARY KEY,
-    score_id     TEXT NOT NULL,
-    last_elapsed REAL NOT NULL DEFAULT 0.0,
-    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    id             TEXT PRIMARY KEY,
+    score_id       TEXT NOT NULL,
+    last_elapsed   REAL NOT NULL DEFAULT 0.0,
+    located        INTEGER NOT NULL DEFAULT 0,
+    origin_elapsed REAL NOT NULL DEFAULT 0.0,
+    origin_position TEXT NOT NULL DEFAULT '1:1:0',
+    origin_ticks   INTEGER NOT NULL DEFAULT 0,
+    created_at     TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (score_id) REFERENCES scores(id) ON DELETE CASCADE
 );
 
@@ -91,7 +110,26 @@ CREATE TABLE IF NOT EXISTS cue_deliveries (
     FOREIGN KEY (rehearsal_id, cue_index)
         REFERENCES rehearsal_cues(rehearsal_id, cue_index) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS cue_skips (
+    rehearsal_id TEXT NOT NULL,
+    cue_index    INTEGER NOT NULL,
+    skipped_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (rehearsal_id, cue_index),
+    FOREIGN KEY (rehearsal_id, cue_index)
+        REFERENCES rehearsal_cues(rehearsal_id, cue_index) ON DELETE CASCADE
+);
 """
+
+# 旧库（定位功能上线前）增量迁移列；新库由建表语句直接带上。
+_MIGRATION_COLUMNS = {
+    "rehearsals": [
+        ("located", "INTEGER NOT NULL DEFAULT 0"),
+        ("origin_elapsed", "REAL NOT NULL DEFAULT 0.0"),
+        ("origin_position", "TEXT NOT NULL DEFAULT '1:1:0'"),
+        ("origin_ticks", "INTEGER NOT NULL DEFAULT 0"),
+    ],
+}
 
 
 class ScoreNotFound(Exception):
@@ -122,6 +160,18 @@ class ElapsedRegression(Exception):
         )
 
 
+class LocateMismatch(Exception):
+    """定位提交秒数与当前已领取进度不一致（-> 409，状态不变）。"""
+
+    def __init__(self, elapsed: float, last_elapsed: float):
+        self.elapsed = elapsed
+        self.last_elapsed = last_elapsed
+        super().__init__(
+            f"定位秒数必须等于当前已领取进度：提交 {elapsed}，"
+            f"已领取到 {last_elapsed}"
+        )
+
+
 def new_id() -> str:
     return uuid.uuid4().hex
 
@@ -139,6 +189,18 @@ class Store:
         with self._connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(_SCHEMA)
+            self._migrate(conn)
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """对旧库增量补列/补表（幂等）；旧排练的计时起点默认排练开始。"""
+        for table, columns in _MIGRATION_COLUMNS.items():
+            existing = {
+                r["name"]
+                for r in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for name, decl in columns:
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
     # ------------------------------------------------------------------ #
     def _connect(self) -> sqlite3.Connection:
@@ -314,10 +376,10 @@ class Store:
         return self.get_rehearsal(rehearsal_id)
 
     def get_rehearsal(self, rehearsal_id: str) -> dict:
-        """返回排练、全部提示及其发放记录；不存在抛 :class:`RehearsalNotFound`。
+        """返回排练、全部提示及其发放/跳过记录；不存在抛 :class:`RehearsalNotFound`。
 
-        与 :meth:`get_score` 相同，三张表在同一个显式读事务内读取，
-        与领取/发布交错时不会跨快照拼接。
+        与 :meth:`get_score` 相同，各张表在同一个显式读事务内读取，
+        与领取/定位/发布交错时不会跨快照拼接。
         """
         with self._connect() as conn:
             conn.execute("BEGIN")
@@ -336,15 +398,28 @@ class Store:
                 "SELECT * FROM cue_deliveries WHERE rehearsal_id = ?",
                 (rehearsal_id,),
             ).fetchall()
+            skip_rows = conn.execute(
+                "SELECT cue_index FROM cue_skips WHERE rehearsal_id = ?",
+                (rehearsal_id,),
+            ).fetchall()
             conn.commit()
         deliveries = {d["cue_index"]: d for d in delivery_rows}
+        skipped = {s["cue_index"] for s in skip_rows}
         return {
             "id": row["id"],
             "score_id": row["score_id"],
             "last_elapsed_seconds": row["last_elapsed"],
+            "located": bool(row["located"]),
+            "origin_elapsed_seconds": row["origin_elapsed"],
+            "origin_position": row["origin_position"],
+            "origin_ticks": row["origin_ticks"],
             "created_at": row["created_at"],
             "cues": [
-                self._hydrate_cue(c, deliveries.get(c["cue_index"]))
+                self._hydrate_cue(
+                    c,
+                    deliveries.get(c["cue_index"]),
+                    c["cue_index"] in skipped,
+                )
                 for c in cue_rows
             ],
         }
@@ -357,12 +432,14 @@ class Store:
     ) -> dict:
         """单事务领取到点提示（进度只前进，每条提示最多发放一次）。
 
-        ``plan(score, pending_cues)`` 是引擎层注入的纯计算回调：在
-        ``BEGIN IMMEDIATE`` 事务内、基于本事务快照读出的谱例当前已提交
-        速度图，对未发提示计算触发秒数并筛出到点项（按触发秒数、录入
-        顺序排序）。整个读-算-写在同一写事务内完成，与发布交错时二者
-        必居其一，故**写入发放记录的修订号必然等于本次计算到点所用的
-        修订号**；并发领取被写锁串行化，同一提示最多发放一次
+        ``plan(score, pending_cues, origin)`` 是引擎层注入的纯计算回调：
+        在 ``BEGIN IMMEDIATE`` 事务内、基于本事务快照读出的谱例当前已提交
+        速度图，对未发且未跳过的提示按当前计时起点 ``origin``
+        （``{"elapsed", "position", "total_ticks", "located"}``）计算触发
+        秒数并筛出到点项（按触发秒数、录入顺序排序）。整个读-算-写在
+        同一写事务内完成，与发布交错时二者必居其一，故**写入发放记录的
+        修订号必然等于本次计算到点所用的修订号**；并发领取/定位被写锁
+        串行化，发放记录与跳过记录互斥，同一提示最多发放一次
         （``cue_deliveries`` 主键兜底）。
 
         倒退（elapsed 小于已领取进度）-> :class:`ElapsedRegression`，
@@ -399,6 +476,13 @@ class Store:
                     (rehearsal_id,),
                 ).fetchall()
             }
+            skipped = {
+                r["cue_index"]
+                for r in conn.execute(
+                    "SELECT cue_index FROM cue_skips WHERE rehearsal_id = ?",
+                    (rehearsal_id,),
+                ).fetchall()
+            }
             pending = [
                 {
                     "cue_index": c["cue_index"],
@@ -408,6 +492,7 @@ class Store:
                 }
                 for c in cue_rows
                 if c["cue_index"] not in delivered
+                and c["cue_index"] not in skipped
             ]
             score = {
                 "id": score_row["id"],
@@ -416,8 +501,15 @@ class Store:
                 "tempo_points": json.loads(score_row["tempo_points"]),
                 "revision": score_row["revision"],
             }
-            # 纯计算：按本事务快照里的当前已提交速度图给未发提示定时。
-            due = plan(score, pending)
+            origin = {
+                "located": bool(row["located"]),
+                "elapsed": row["origin_elapsed"],
+                "position": row["origin_position"],
+                "total_ticks": row["origin_ticks"],
+            }
+            # 纯计算：按本事务快照里的当前已提交速度图与计时起点给
+            # 待发（未发且未跳过）提示定时。
+            due = plan(score, pending, origin)
             revision = score["revision"]
             for d in due:
                 conn.execute(
@@ -457,18 +549,134 @@ class Store:
             }
 
     # ------------------------------------------------------------------ #
+    def locate_rehearsal(
+        self,
+        rehearsal_id: str,
+        elapsed: float,
+        position: str,
+        resolve: Callable[[dict, str], tuple[int, str]],
+    ) -> dict:
+        """单事务定位（跳转）：更新计时起点，目标之前的未发提示记跳过。
+
+        ``resolve(score, position)`` 是引擎层注入的纯计算回调，在
+        ``BEGIN IMMEDIATE`` 事务内按本事务快照中谱例当前已提交速度图所用
+        的同一套 PPQ/拍号，把目标 ``小节:拍:tick`` 展开为
+        ``(total_ticks, 规范位置字符串)``；位置非法时抛
+        :class:`~app.tempo.TempoMapError`。
+
+        校验顺序：排练不存在 -> :class:`RehearsalNotFound`；
+        提交秒数不等于当前已领取进度 -> :class:`LocateMismatch`
+        （**状态不变**）；目标位置非法由回调抛出（同样在提交前，
+        **状态不变**）。
+
+        成功后：未发且未跳过、tick 严格位于目标之前的提示写入
+        ``cue_skips``（永不发放）；已发提示不动、已跳过提示不恢复，
+        故回跳不重发、不恢复；计时起点更新为（elapsed, 目标位置,
+        目标 tick），领取进度不变。
+        """
+        with self._write_lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM rehearsals WHERE id = ?", (rehearsal_id,)
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                raise RehearsalNotFound(rehearsal_id)
+            # 定位秒数必须恰好等于当前领取进度，否则拒绝且状态不变。
+            if elapsed != row["last_elapsed"]:
+                conn.rollback()
+                raise LocateMismatch(elapsed, row["last_elapsed"])
+
+            score_row = conn.execute(
+                "SELECT * FROM scores WHERE id = ?", (row["score_id"],)
+            ).fetchone()
+            if score_row is None:  # 外键保证不会发生；防御性处理
+                conn.rollback()
+                raise ScoreNotFound(row["score_id"])
+            score = {
+                "id": score_row["id"],
+                "ppq": score_row["ppq"],
+                "time_signatures": json.loads(score_row["time_signatures"]),
+                "tempo_points": json.loads(score_row["tempo_points"]),
+                "revision": score_row["revision"],
+            }
+            # 纯计算：在事务快照内展开目标位置（非法即抛错、回滚）。
+            target_ticks, target_position = resolve(score, position)
+
+            delivered = {
+                r["cue_index"]
+                for r in conn.execute(
+                    "SELECT cue_index FROM cue_deliveries WHERE rehearsal_id = ?",
+                    (rehearsal_id,),
+                ).fetchall()
+            }
+            skipped = {
+                r["cue_index"]
+                for r in conn.execute(
+                    "SELECT cue_index FROM cue_skips WHERE rehearsal_id = ?",
+                    (rehearsal_id,),
+                ).fetchall()
+            }
+            cue_ticks = {
+                c["cue_index"]: c["total_ticks"]
+                for c in conn.execute(
+                    "SELECT cue_index, total_ticks FROM rehearsal_cues "
+                    "WHERE rehearsal_id = ?",
+                    (rehearsal_id,),
+                ).fetchall()
+            }
+            # 目标之前、且尚未发放/跳过的提示记为跳过。回跳时已发的
+            # 仍在前也不动（不重发），已跳过的仍在后也不恢复。
+            to_skip = [
+                idx
+                for idx in cue_ticks
+                if idx not in delivered
+                and idx not in skipped
+                and cue_ticks[idx] < target_ticks
+            ]
+            conn.executemany(
+                "INSERT INTO cue_skips (rehearsal_id, cue_index) VALUES (?, ?)",
+                [(rehearsal_id, idx) for idx in to_skip],
+            )
+            # 每次定位都以（该秒数, 目标位置）重置计时起点；
+            # 发布不触碰这些列，故定位起点不随修订改变。
+            conn.execute(
+                "UPDATE rehearsals SET located = 1, origin_elapsed = ?, "
+                "origin_position = ?, origin_ticks = ? WHERE id = ?",
+                (elapsed, target_position, target_ticks, rehearsal_id),
+            )
+            conn.commit()
+        return self.get_rehearsal(rehearsal_id)
+
+    # ------------------------------------------------------------------ #
     @staticmethod
     def _hydrate_cue(
-        cue: sqlite3.Row, delivery: Optional[sqlite3.Row]
+        cue: sqlite3.Row,
+        delivery: Optional[sqlite3.Row],
+        skipped: bool = False,
     ) -> dict:
+        if delivery is not None:
+            status = "delivered"
+            trigger_seconds: Optional[float] = delivery["trigger_seconds"]
+            revision: Optional[int] = delivery["revision"]
+        elif skipped:
+            status = "skipped"
+            trigger_seconds = None
+            revision = None
+        else:
+            status = "pending"
+            trigger_seconds = None
+            revision = None
         return {
             "index": cue["cue_index"],
             "position": cue["position"],
             "text": cue["text"],
             "total_ticks": cue["total_ticks"],
+            "status": status,
             "delivered": delivery is not None,
-            "trigger_seconds": delivery["trigger_seconds"] if delivery else None,
-            "revision": delivery["revision"] if delivery else None,
+            "skipped": skipped,
+            "trigger_seconds": trigger_seconds,
+            "revision": revision,
         }
 
     @staticmethod

@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .db import (
     ElapsedRegression,
+    LocateMismatch,
     RehearsalNotFound,
     RevisionConflict,
     ScoreNotFound,
@@ -30,9 +31,11 @@ app = FastAPI(
         "并提供带录音锚点的速度图修订（创建/预览/发布，乐观锁修订号），"
         "以及排练提示：为已保存的谱例创建排练，按谱例当前已提交的速度图给"
         "未发提示定时，客户端凭从排练开始累计的秒数领取到点提示"
-        "（进度只前进，发放记录含所用修订号）。"
+        "（进度只前进，发放记录含所用修订号）；排练中途可凭当前累计秒数"
+        "与目标位置定位（跳转），目标之前的未发提示记为跳过，"
+        "之后按目标到提示的速度图时长定时。"
     ),
-    version="1.2.0",
+    version="1.3.0",
 )
 
 # SQLite 持久化（默认 ./data/tempo.db，可用 TEMPO_DB_PATH 覆盖；
@@ -262,6 +265,7 @@ async def root() -> dict:
         "convert": "/convert",
         "scores": "/scores",
         "rehearsals": "/rehearsals",
+        "locates": "/rehearsals/{id}/locates",
     }
 
 
@@ -644,7 +648,15 @@ class CueStatus(BaseModel):
     position: str
     text: str
     total_ticks: int = Field(..., description="提示位置距起点的 tick 总数（PPQ 坐标）")
-    delivered: bool = Field(..., description="是否已发放（已发提示不撤回）")
+    status: Literal["pending", "delivered", "skipped"] = Field(
+        ...,
+        description=(
+            "提示状态：pending=待发，delivered=已发放（已发不撤回），"
+            "skipped=定位跳过时位于目标之前（永不发放，回跳也不恢复）"
+        ),
+    )
+    delivered: bool = Field(..., description="是否已发放（等价于 status=delivered）")
+    skipped: bool = Field(..., description="是否被定位跳过（等价于 status=skipped）")
     trigger_seconds: Optional[float] = Field(
         None, description="已发放提示的触发秒数（按发放时所用速度图修订计算）"
     )
@@ -659,6 +671,23 @@ class RehearsalOut(BaseModel):
     last_elapsed_seconds: float = Field(
         ..., description="已领取到的最大累计秒数；领取进度只能前进"
     )
+    located: bool = Field(
+        ..., description="是否做过定位（跳转）；未定位的排练以排练开始为计时起点"
+    )
+    origin_elapsed_seconds: float = Field(
+        ...,
+        description=(
+            "当前计时起点的累计秒数（定位时提交的秒数，未定位为 0）；"
+            "待发提示触发秒数 = 该秒数 + 按当前已提交速度图算出的"
+            "“起点位置 -> 提示位置”时长"
+        ),
+    )
+    origin_position: str = Field(
+        ..., description="当前计时起点的乐谱位置（最近一次定位的目标；未定位为 1:1:0）"
+    )
+    origin_ticks: int = Field(
+        ..., description="当前计时起点的 tick 坐标（最近一次定位的目标 tick）"
+    )
     cues: list[CueStatus]
 
 
@@ -668,6 +697,23 @@ class ClaimRequest(BaseModel):
         description=(
             "从排练开始累计的秒数（非负、有限）；只能前进，"
             "早于已领取进度返回 409 且状态不变"
+        ),
+    )
+
+
+class LocateRequest(BaseModel):
+    elapsed_seconds: float = Field(
+        ...,
+        description=(
+            "当前已领取的累计秒数（非负、有限）；必须与服务端已领取进度"
+            "严格相等，否则返回 409 且状态不变"
+        ),
+    )
+    position: str = Field(
+        ...,
+        description=(
+            "跳转目标乐谱位置 '小节:拍:tick'（拍按当前拍号分母计）；"
+            "目标之前尚未发放的提示记为跳过，目标处提示可在同一秒领取"
         ),
     )
 
@@ -721,19 +767,54 @@ def _regression(exc: ElapsedRegression) -> JSONResponse:
     return _error_response([detail], status_code=409)
 
 
-def _due_cues(score: dict, pending: list[dict], elapsed: float) -> list[dict]:
-    """按谱例当前已提交速度图计算未发提示的触发秒数，筛出到点项。
+def _locate_mismatch(exc: LocateMismatch) -> JSONResponse:
+    # 定位秒数不等于当前领取进度：409，状态不变（不跳过、不更新起点）。
+    detail = {
+        "loc": ["body", "elapsed_seconds"],
+        "msg": (
+            f"定位秒数必须等于当前已领取进度：本次 {exc.elapsed}s "
+            f"不等于已领取进度 {exc.last_elapsed}s"
+        ),
+        "index": None,
+        "elapsed_seconds": exc.elapsed,
+        "last_elapsed_seconds": exc.last_elapsed,
+    }
+    return _error_response([detail], status_code=409)
+
+
+def _due_cues(
+    score: dict, pending: list[dict], elapsed: float, origin: dict | None = None
+) -> list[dict]:
+    """按谱例当前已提交速度图与计时起点计算待发提示触发秒数，筛出到点项。
+
+    触发秒数 = 起点累计秒数 + 速度图上“起点位置 -> 提示位置”的时长，
+    即 ``origin_elapsed + (seconds_at_tick(cue) - seconds_at_tick(origin))``。
+    未定位排练的起点为 1:1:0 / 0 tick / 0 s，公式退化为直接取
+    ``seconds_at_tick``。定位起点秒数处（时长 0）的目标提示恰好在
+    定位提交的同一秒到点。
 
     返回项按（触发秒数, 录入顺序）排序。本函数作为纯计算回调在
     :meth:`Store.claim_cues` 的写事务内执行，``score`` 即该事务快照
     中的当前修订，保证计算所用修订与发放记录一致。
     """
+    origin = origin or {
+        "located": False,
+        "elapsed": 0.0,
+        "position": "1:1:0",
+        "total_ticks": 0,
+    }
     tmap = _build_map(
         score["ppq"], score["time_signatures"], score["tempo_points"]
     )
+    origin_seconds = tmap.seconds_at_tick(origin["total_ticks"])
+    base_elapsed = origin["elapsed"]
     due = []
     for c in pending:
-        trigger = tmap.seconds_at_tick(c["total_ticks"])
+        trigger = (
+            base_elapsed
+            + tmap.seconds_at_tick(c["total_ticks"])
+            - origin_seconds
+        )
         if trigger <= elapsed:
             due.append({"cue_index": c["cue_index"], "trigger_seconds": trigger})
     due.sort(key=lambda d: (d["trigger_seconds"], d["cue_index"]))
@@ -816,8 +897,8 @@ async def claim_rehearsal_cues(rehearsal_id: str, req: ClaimRequest):
         )
     elapsed_value = float(elapsed)
 
-    def plan(score: dict, pending: list[dict]) -> list[dict]:
-        return _due_cues(score, pending, elapsed_value)
+    def plan(score: dict, pending: list[dict], origin: dict) -> list[dict]:
+        return _due_cues(score, pending, elapsed_value, origin)
 
     try:
         result = store.claim_cues(rehearsal_id, elapsed_value, plan)
@@ -830,9 +911,62 @@ async def claim_rehearsal_cues(rehearsal_id: str, req: ClaimRequest):
     return ClaimResponse.model_validate(result)
 
 
+@app.post(
+    "/rehearsals/{rehearsal_id}/locates", response_model=RehearsalOut
+)
+async def locate_rehearsal(rehearsal_id: str, req: LocateRequest):
+    """定位（跳转）：以当前累计秒数 + 目标位置更新计时起点。
+
+    提交的秒数必须**恰好等于**当前已领取进度（不等 -> 409 且状态不变）；
+    目标之前尚未发放的提示记为跳过（永不发放），目标处及之后的待发提示
+    按目标到提示的速度图时长重新定时，故目标处提示可在同一秒领取。
+    回跳不重发已发提示、不恢复已跳过提示。
+    """
+    elapsed = req.elapsed_seconds
+    if not (
+        isinstance(elapsed, (int, float))
+        and not isinstance(elapsed, bool)
+        and math.isfinite(elapsed)
+        and elapsed >= 0
+    ):
+        raise TempoMapError(
+            [
+                {
+                    "loc": ["body", "elapsed_seconds"],
+                    "msg": "elapsed_seconds 必须是有限的非负数",
+                    "index": None,
+                }
+            ]
+        )
+    elapsed_value = float(elapsed)
+
+    def resolve(score: dict, position: str) -> tuple[int, str]:
+        # 位置展开与创建排练/锚点同一套规则（带 loc 的 422）；
+        # 在 store 的写事务快照内执行，PPQ/拍号即该事务所见版本。
+        tmap = _build_map(
+            score["ppq"], score["time_signatures"], score["tempo_points"]
+        )
+        total_ticks = tmap.mbt_to_ticks(
+            position, loc=("body", "position")
+        )
+        return total_ticks, str(tmap.ticks_to_mbt(total_ticks))
+
+    try:
+        result = store.locate_rehearsal(
+            rehearsal_id, elapsed_value, req.position, resolve
+        )
+    except RehearsalNotFound:
+        return _rehearsal_not_found(rehearsal_id)
+    except LocateMismatch as exc:
+        return _locate_mismatch(exc)
+    except ScoreNotFound as exc:  # 防御性：谱例被删（正常不会发生）
+        return _not_found(str(exc))
+    return RehearsalOut.model_validate(result)
+
+
 @app.get("/rehearsals/{rehearsal_id}", response_model=RehearsalOut)
 async def get_rehearsal(rehearsal_id: str):
-    """查询排练：提示列表、发放状态（触发秒数/所用修订）与已领取进度。"""
+    """查询排练：计时起点、提示列表（待发/已发/跳过）与已领取进度。"""
     try:
         rehearsal = store.get_rehearsal(rehearsal_id)
     except RehearsalNotFound:

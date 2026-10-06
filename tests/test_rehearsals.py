@@ -322,7 +322,7 @@ def test_concurrent_claims_deliver_each_cue_at_most_once(fresh_db):
         try:
             barrier.wait(timeout=10)
             res = store.claim_cues(
-                rid, 1000.0, lambda s, p: _due_cues(s, p, 1000.0)
+                rid, 1000.0, lambda s, p, o: _due_cues(s, p, 1000.0, o)
             )
             results.append([c["index"] for c in res["cues"]])
         except Exception as exc:  # pragma: no cover - 失败时下面断言暴露
