@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .db import (
     ElapsedRegression,
+    OriginMismatch,
     RehearsalNotFound,
     RevisionConflict,
     ScoreNotFound,
@@ -30,9 +31,11 @@ app = FastAPI(
         "并提供带录音锚点的速度图修订（创建/预览/发布，乐观锁修订号），"
         "以及排练提示：为已保存的谱例创建排练，按谱例当前已提交的速度图给"
         "未发提示定时，客户端凭从排练开始累计的秒数领取到点提示"
-        "（进度只前进，发放记录含所用修订号）。"
+        "（进度只前进，发放记录含所用修订号）；排练中途可定位（跳转）到"
+        "另一乐谱位置：提交当前已领取累计秒数与目标位置，目标之前的未发"
+        "提示记为跳过，此后提示按目标到提示的速度图时长相对该累计秒数定时。"
     ),
-    version="1.2.0",
+    version="1.3.0",
 )
 
 # SQLite 持久化（默认 ./data/tempo.db，可用 TEMPO_DB_PATH 覆盖；
@@ -644,12 +647,22 @@ class CueStatus(BaseModel):
     position: str
     text: str
     total_ticks: int = Field(..., description="提示位置距起点的 tick 总数（PPQ 坐标）")
-    delivered: bool = Field(..., description="是否已发放（已发提示不撤回）")
+    status: Literal["pending", "delivered", "skipped"] = Field(
+        ...,
+        description=(
+            "提示状态：pending=待发，delivered=已发放（不撤回、不重发），"
+            "skipped=定位跳过时位于目标位置之前（回跳也不恢复）"
+        ),
+    )
+    delivered: bool = Field(..., description="是否已发放（与 status == 'delivered' 等价）")
     trigger_seconds: Optional[float] = Field(
         None, description="已发放提示的触发秒数（按发放时所用速度图修订计算）"
     )
     revision: Optional[int] = Field(
         None, description="发放时所用的速度图修订号（与触发秒数同一次计算）"
+    )
+    skipped_revision: Optional[int] = Field(
+        None, description="记为跳过时所用的速度图修订号；pending/delivered 时为 null"
     )
 
 
@@ -659,7 +672,25 @@ class RehearsalOut(BaseModel):
     last_elapsed_seconds: float = Field(
         ..., description="已领取到的最大累计秒数；领取进度只能前进"
     )
+    origin: "TimingOrigin" = Field(
+        ...,
+        description=(
+            "当前计时起点：每次定位更新（未定位时为 1:1:0 / 0.0s）；"
+            "后续提示触发秒数 = origin_elapsed_seconds + "
+            "速度图上 origin 位置到提示位置的时长"
+        ),
+    )
     cues: list[CueStatus]
+
+
+class TimingOrigin(BaseModel):
+    position: str = Field(
+        ..., description="最近一次定位的目标乐谱位置（未定位时为 1:1:0）"
+    )
+    total_ticks: int = Field(..., description="计时起点位置的 tick 坐标")
+    elapsed_seconds: float = Field(
+        ..., description="定位时提交、作为新起点的累计秒数（未定位时为 0.0）"
+    )
 
 
 class ClaimRequest(BaseModel):
@@ -693,6 +724,53 @@ class ClaimResponse(BaseModel):
     )
 
 
+class LocateRequest(BaseModel):
+    elapsed_seconds: float = Field(
+        ...,
+        description=(
+            "当前已领取的累计秒数（非负、有限）；必须与排练当前进度"
+            "完全相等，否则返回 409 且状态不变"
+        ),
+    )
+    position: str = Field(
+        ...,
+        description=(
+            "定位目标乐谱位置 '小节:拍:tick'（拍按当前拍号分母计），"
+            "如 4:1:0"
+        ),
+    )
+
+
+class SkippedCue(BaseModel):
+    index: int
+    position: str
+    text: str
+    total_ticks: int
+    revision: int = Field(..., description="定位（记为跳过）时谱例的速度图修订号")
+
+
+class LocateResponse(BaseModel):
+    id: str
+    elapsed_seconds: float = Field(
+        ..., description="本次定位提交并作为新计时起点的累计秒数"
+    )
+    revision: int = Field(
+        ..., description="定位时谱例当前已提交的速度图修订号（与跳过记录一致）"
+    )
+    origin: TimingOrigin
+    skipped: list[SkippedCue] = Field(
+        ...,
+        description=(
+            "本次新记为跳过的提示（此前待发且位于目标位置之前；"
+            "位于目标处的提示不跳过，可在提交的同一秒领取）"
+        ),
+    )
+    cues: list[CueStatus] = Field(..., description="定位后的全部提示状态")
+
+
+RehearsalOut.model_rebuild()
+
+
 def _rehearsal_not_found(rehearsal_id: str) -> JSONResponse:
     return _error_response(
         [
@@ -721,8 +799,39 @@ def _regression(exc: ElapsedRegression) -> JSONResponse:
     return _error_response([detail], status_code=409)
 
 
+def _origin_mismatch(exc: OriginMismatch) -> JSONResponse:
+    # 定位秒数不等于当前领取进度：409，起点/跳过/已发记录一律不变。
+    detail = {
+        "loc": ["body", "elapsed_seconds"],
+        "msg": (
+            f"定位秒数必须等于当前已领取进度：本次 {exc.elapsed}s，"
+            f"已领取进度 {exc.last_elapsed}s"
+        ),
+        "index": None,
+        "elapsed_seconds": exc.elapsed,
+        "last_elapsed_seconds": exc.last_elapsed,
+    }
+    return _error_response([detail], status_code=409)
+
+
+def _origin_offset_seconds(score: dict, tmap: TempoMap) -> float:
+    """定位计时起点在当前速度图上的秒数（origin 默认 1:1:0，即 0.0s）。
+
+    触发秒数统一为：提交定位秒数 + 起点 tick 到提示 tick 的速度图时长，
+    即 ``origin_elapsed + seconds_at(cue) - seconds_at(origin)``。
+    未定位的排练起点为 (tick 0, 0.0s)，退化为原有的“按全图从 0 开始计时”。
+    """
+    return (
+        float(score.get("origin_elapsed", 0.0))
+        - tmap.seconds_at_tick(score.get("origin_ticks", 0))
+    )
+
+
 def _due_cues(score: dict, pending: list[dict], elapsed: float) -> list[dict]:
     """按谱例当前已提交速度图计算未发提示的触发秒数，筛出到点项。
+
+    触发秒数相对排练当前定位起点：origin_elapsed + 起点到提示的速度图
+    时长（定位起点不变；速度图发布后待发提示自然按新修订重算）。
 
     返回项按（触发秒数, 录入顺序）排序。本函数作为纯计算回调在
     :meth:`Store.claim_cues` 的写事务内执行，``score`` 即该事务快照
@@ -731,13 +840,48 @@ def _due_cues(score: dict, pending: list[dict], elapsed: float) -> list[dict]:
     tmap = _build_map(
         score["ppq"], score["time_signatures"], score["tempo_points"]
     )
+    offset = _origin_offset_seconds(score, tmap)
     due = []
     for c in pending:
-        trigger = tmap.seconds_at_tick(c["total_ticks"])
+        trigger = offset + tmap.seconds_at_tick(c["total_ticks"])
         if trigger <= elapsed:
             due.append({"cue_index": c["cue_index"], "trigger_seconds": trigger})
     due.sort(key=lambda d: (d["trigger_seconds"], d["cue_index"]))
     return due
+
+
+def _skip_before_target(
+    score: dict, pending: list[dict], target_ticks: int
+) -> list[int]:
+    """定位回调：返回待发提示中 tick 严格位于目标位置之前的下标。
+
+    与目标同 tick 的提示不跳过（可在定位提交的同一秒领取）；
+    回调只读取当前修订快照，是否跳过只取决于坐标先后，与速度无关。
+    """
+    return sorted(
+        c["cue_index"] for c in pending if c["total_ticks"] < target_ticks
+    )
+
+
+def _rehearsal_out(score: dict, rehearsal: dict) -> RehearsalOut:
+    """组装排练响应：补上计时起点位置字符串（tick -> 小节:拍:tick）。"""
+    tmap = _build_map(
+        score["ppq"], score["time_signatures"], score["tempo_points"]
+    )
+    origin_ticks = rehearsal.get("origin_ticks", 0)
+    return RehearsalOut.model_validate(
+        {
+            "id": rehearsal["id"],
+            "score_id": rehearsal["score_id"],
+            "last_elapsed_seconds": rehearsal["last_elapsed_seconds"],
+            "origin": {
+                "position": str(tmap.ticks_to_mbt(origin_ticks)),
+                "total_ticks": origin_ticks,
+                "elapsed_seconds": rehearsal.get("origin_elapsed_seconds", 0.0),
+            },
+            "cues": rehearsal["cues"],
+        }
+    )
 
 
 @app.post("/rehearsals", response_model=RehearsalOut, status_code=201)
@@ -792,7 +936,7 @@ async def create_rehearsal(req: RehearsalCreateRequest):
         rehearsal = store.create_rehearsal(req.score_id, cue_rows)
     except ScoreNotFound:
         return _not_found(req.score_id)
-    return RehearsalOut.model_validate(rehearsal)
+    return _rehearsal_out(score, rehearsal)
 
 
 @app.post("/rehearsals/{rehearsal_id}/claims", response_model=ClaimResponse)
@@ -830,11 +974,92 @@ async def claim_rehearsal_cues(rehearsal_id: str, req: ClaimRequest):
     return ClaimResponse.model_validate(result)
 
 
-@app.get("/rehearsals/{rehearsal_id}", response_model=RehearsalOut)
-async def get_rehearsal(rehearsal_id: str):
-    """查询排练：提示列表、发放状态（触发秒数/所用修订）与已领取进度。"""
+@app.post("/rehearsals/{rehearsal_id}/locate", response_model=LocateResponse)
+async def locate_rehearsal(rehearsal_id: str, req: LocateRequest):
+    """定位（跳转）到另一乐谱位置：提交当前已领取累计秒数与目标位置。
+
+    目标之前的未发提示记为跳过（回跳不恢复、不重发）；计时起点更新为
+    （提交秒数, 目标位置），此后提示触发秒数 = 提交秒数 + 速度图上
+    目标到提示的时长。提交秒数必须等于当前领取进度，否则 409 状态不变。
+    """
+    elapsed = req.elapsed_seconds
+    if not (
+        isinstance(elapsed, (int, float))
+        and not isinstance(elapsed, bool)
+        and math.isfinite(elapsed)
+        and elapsed >= 0
+    ):
+        raise TempoMapError(
+            [
+                {
+                    "loc": ["body", "elapsed_seconds"],
+                    "msg": "elapsed_seconds 必须是有限的非负数",
+                    "index": None,
+                }
+            ]
+        )
+    elapsed_value = float(elapsed)
+
+    # 位置按谱例当前 PPQ/拍号校验（速度点修订不改坐标）。先取谱例：
+    # 排练不存在优先返回 404（与领取/查询一致）。
     try:
         rehearsal = store.get_rehearsal(rehearsal_id)
     except RehearsalNotFound:
         return _rehearsal_not_found(rehearsal_id)
-    return RehearsalOut.model_validate(rehearsal)
+    try:
+        score = store.get_score(rehearsal["score_id"])
+    except ScoreNotFound:  # 防御性：谱例被删（正常不会发生）
+        return _not_found(rehearsal["score_id"])
+
+    tmap = _build_map(
+        score["ppq"], score["time_signatures"], score["tempo_points"]
+    )
+    target_ticks = tmap.mbt_to_ticks(
+        req.position, loc=("body", "position")
+    )
+
+    try:
+        result = store.locate(
+            rehearsal_id, elapsed_value, target_ticks, _skip_before_target
+        )
+    except OriginMismatch as exc:
+        return _origin_mismatch(exc)
+    except ScoreNotFound as exc:  # 防御性：谱例被删（正常不会发生）
+        return _not_found(str(exc))
+
+    by_index = {c["index"]: c for c in result["rehearsal"]["cues"]}
+    skipped = []
+    for cue_index in result["skipped"]:
+        c = by_index[cue_index]
+        skipped.append(
+            SkippedCue(
+                index=cue_index,
+                position=c["position"],
+                text=c["text"],
+                total_ticks=c["total_ticks"],
+                revision=result["revision"],
+            )
+        )
+    origin = _rehearsal_out(score, result["rehearsal"]).origin
+    return LocateResponse(
+        id=rehearsal_id,
+        elapsed_seconds=elapsed_value,
+        revision=result["revision"],
+        origin=origin,
+        skipped=skipped,
+        cues=result["rehearsal"]["cues"],
+    )
+
+
+@app.get("/rehearsals/{rehearsal_id}", response_model=RehearsalOut)
+async def get_rehearsal(rehearsal_id: str):
+    """查询排练：提示列表、发放/跳过状态（触发秒数/所用修订）与计时起点。"""
+    try:
+        rehearsal = store.get_rehearsal(rehearsal_id)
+    except RehearsalNotFound:
+        return _rehearsal_not_found(rehearsal_id)
+    try:
+        score = store.get_score(rehearsal["score_id"])
+    except ScoreNotFound:  # 防御性：谱例被删（正常不会发生）
+        return _not_found(rehearsal["score_id"])
+    return _rehearsal_out(score, rehearsal)

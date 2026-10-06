@@ -1,6 +1,8 @@
-"""排练提示：创建排练 / 领取到点提示 / 进度与并发 端到端测试。"""
+"""排练提示：创建排练 / 领取到点提示 / 定位跳转 / 进度与并发 端到端测试。"""
 
+import json
 import math
+import sqlite3
 import threading
 
 import pytest
@@ -52,6 +54,13 @@ def create_rehearsal(score_id, cues):
 
 def claim(rid, elapsed):
     return client.post(f"/rehearsals/{rid}/claims", json={"elapsed_seconds": elapsed})
+
+
+def locate(rid, elapsed, position):
+    return client.post(
+        f"/rehearsals/{rid}/locate",
+        json={"elapsed_seconds": elapsed, "position": position},
+    )
 
 
 # ---------------------------------------------------------------------- #
@@ -378,3 +387,492 @@ def test_rehearsal_and_deliveries_survive_store_restart(fresh_db, monkeypatch):
     assert all(c["delivered"] for c in detail["cues"])
     assert math.isclose(detail["cues"][0]["trigger_seconds"], 2.0)
     assert detail["cues"][0]["revision"] == 0
+
+
+# ---------------------------------------------------------------------- #
+# 定位（跳转）：跳过目标前提示、重置计时起点
+# ---------------------------------------------------------------------- #
+def test_rehearsal_query_distinguishes_pending_delivered_skipped_and_origin():
+    score = create_score()
+    r = create_rehearsal(
+        score["id"],
+        [{"position": "2:1:0", "text": "B"}],
+    )
+    got = client.get(f"/rehearsals/{r['id']}").json()
+    # 未定位：计时起点 1:1:0 / 0.0s
+    assert got["origin"] == {
+        "position": "1:1:0",
+        "total_ticks": 0,
+        "elapsed_seconds": 0.0,
+    }
+    cue = got["cues"][0]
+    assert cue["status"] == "pending"
+    assert cue["delivered"] is False
+    assert cue["trigger_seconds"] is None and cue["revision"] is None
+    assert cue["skipped_revision"] is None
+
+
+def test_locate_marks_pending_cues_before_target_skipped():
+    # B=2:1:0(2.0s)、C=3:1:0(4.0s)、E=5:1:0(8.0s)
+    score = create_score()
+    r = create_rehearsal(
+        score["id"],
+        [
+            {"position": "2:1:0", "text": "B"},
+            {"position": "3:1:0", "text": "C"},
+            {"position": "5:1:0", "text": "E"},
+        ],
+    )
+    rid = r["id"]
+    claim(rid, 2.0)  # B 已发，进度 2.0
+
+    # 跳到 4:1:0（绝对 6.0s），提交累计秒数 2.0
+    resp = locate(rid, 2.0, "4:1:0")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["elapsed_seconds"] == 2.0
+    assert data["revision"] == 0
+    assert data["origin"] == {
+        "position": "4:1:0",
+        "total_ticks": 5760,
+        "elapsed_seconds": 2.0,
+    }
+    # 只有目标之前的待发 C 被跳过；B 已发不动；E 在目标之后仍待发
+    assert [s["text"] for s in data["skipped"]] == ["C"]
+    assert data["skipped"][0]["revision"] == 0
+    assert data["skipped"][0]["total_ticks"] == 3840
+    statuses = {c["text"]: c["status"] for c in data["cues"]}
+    assert statuses == {"B": "delivered", "C": "skipped", "E": "pending"}
+    c_skipped = next(c for c in data["cues"] if c["text"] == "C")
+    assert c_skipped["delivered"] is False
+    assert c_skipped["skipped_revision"] == 0
+    assert c_skipped["trigger_seconds"] is None and c_skipped["revision"] is None
+
+    # 查询同样可区分三种状态并带回定位起点
+    got = client.get(f"/rehearsals/{rid}").json()
+    assert got["origin"]["position"] == "4:1:0"
+    assert [c["status"] for c in got["cues"]] == [
+        "delivered",
+        "skipped",
+        "pending",
+    ]
+    assert got["last_elapsed_seconds"] == 2.0
+
+
+def test_cue_at_target_position_can_be_claimed_at_same_second():
+    # 目标处（tick 相等）的提示不跳过：4:1:0 绝对 6.0s，定位秒数 2.0，
+    # 故触发秒数恰为 2.0，可在同一秒领取。
+    score = create_score()
+    r = create_rehearsal(
+        score["id"],
+        [
+            {"position": "3:1:0", "text": "C"},  # 4.0s < 目标 6.0s -> 跳过
+            {"position": "4:1:0", "text": "T"},  # 目标处 -> 触发 2.0
+        ],
+    )
+    rid = r["id"]
+    claim(rid, 2.0)
+    data = locate(rid, 2.0, "4:1:0").json()
+    assert [s["text"] for s in data["skipped"]] == ["C"]
+    at_target = next(c for c in data["cues"] if c["text"] == "T")
+    assert at_target["status"] == "pending"
+
+    same_second = claim(rid, 2.0).json()
+    assert [c["text"] for c in same_second["cues"]] == ["T"]
+    assert math.isclose(same_second["cues"][0]["trigger_seconds"], 2.0)
+    assert same_second["cues"][0]["revision"] == 0
+
+
+def test_after_locate_triggers_are_origin_elapsed_plus_map_duration():
+    # 先领取 B(2:1:0, 2.0s)，进度 2.0；跳到 4:1:0（绝对 6.0s）并提交
+    # 2.0。E(5:1:0) 绝对 8.0s，与目标相距 2.0s -> 触发秒数 4.0
+    # （而不是全图的 8.0s）。
+    score = create_score()
+    r = create_rehearsal(
+        score["id"],
+        [
+            {"position": "2:1:0", "text": "B"},
+            {"position": "5:1:0", "text": "E"},
+        ],
+    )
+    rid = r["id"]
+    claim(rid, 2.0)
+    locate(rid, 2.0, "4:1:0")
+    assert claim(rid, 3.999).json()["cues"] == []  # 未到点
+    due = claim(rid, 4.0).json()
+    assert [c["text"] for c in due["cues"]] == ["E"]
+    assert math.isclose(due["cues"][0]["trigger_seconds"], 4.0)
+
+    # 进度仍只前进：定位后倒退领取依旧 409
+    assert claim(rid, 3.0).status_code == 409
+
+
+def test_forward_locate_relabels_pending_cues_relative_to_new_origin():
+    # 未做任何领取（进度 0）直接跳到 3:1:0（绝对 4.0s）：
+    # 之前的 B(2.0s) 跳过；E(5:1:0, 8.0s) 触发 = 0 + (8-4) = 4.0s。
+    score = create_score()
+    r = create_rehearsal(
+        score["id"],
+        [
+            {"position": "2:1:0", "text": "B"},
+            {"position": "5:1:0", "text": "E"},
+        ],
+    )
+    rid = r["id"]
+    data = locate(rid, 0.0, "3:1:0").json()
+    assert [s["text"] for s in data["skipped"]] == ["B"]
+    assert data["origin"]["total_ticks"] == 3840
+    due = claim(rid, 4.0).json()
+    assert [c["text"] for c in due["cues"]] == ["E"]
+    assert math.isclose(due["cues"][0]["trigger_seconds"], 4.0)
+
+
+def test_backward_locate_does_not_redeliver_or_restore():
+    score = create_score()
+    r = create_rehearsal(
+        score["id"],
+        [
+            {"position": "2:1:0", "text": "B"},  # 先发
+            {"position": "3:1:0", "text": "C"},  # 前跳时跳过
+            {"position": "5:1:0", "text": "E"},  # 之后发
+        ],
+    )
+    rid = r["id"]
+    assert [c["text"] for c in claim(rid, 2.0).json()["cues"]] == ["B"]
+    locate(rid, 2.0, "4:1:0")  # C 跳过
+    assert [c["text"] for c in claim(rid, 4.0).json()["cues"]] == ["E"]
+
+    # 回跳到 2:1:0（进度此刻 4.0）：本次不产生跳过，也不恢复 C、不重发 B/E
+    data = locate(rid, 4.0, "2:1:0").json()
+    assert data["skipped"] == []
+    assert data["origin"]["position"] == "2:1:0"
+    statuses = {c["text"]: c["status"] for c in data["cues"]}
+    assert statuses == {"B": "delivered", "C": "skipped", "E": "delivered"}
+
+    # 再领到任意秒数都不会冒出 C 或重发
+    assert claim(rid, 1000.0).json()["cues"] == []
+
+
+def test_locate_requires_elapsed_equal_to_claim_progress():
+    score = create_score()
+    r = create_rehearsal(
+        score["id"], [{"position": "3:1:0", "text": "C"}]
+    )
+    rid = r["id"]
+    claim(rid, 2.0)
+    resp = locate(rid, 3.0, "4:1:0")  # 进度是 2.0，提交 3.0
+    assert resp.status_code == 409
+    detail = resp.json()["detail"][0]
+    assert detail["elapsed_seconds"] == 3.0
+    assert detail["last_elapsed_seconds"] == 2.0
+    assert detail["loc"] == ["body", "elapsed_seconds"]
+
+    # 状态不变：起点未更新、提示仍待发，随后按正确秒数仍可定位
+    got = client.get(f"/rehearsals/{rid}").json()
+    assert got["origin"]["total_ticks"] == 0
+    assert got["cues"][0]["status"] == "pending"
+    ok = locate(rid, 2.0, "4:1:0")
+    assert ok.status_code == 200
+
+
+def test_locate_rejects_bad_position_and_nonfinite_elapsed():
+    score = create_score()
+    r = create_rehearsal(score["id"], [{"position": "2:1:0", "text": "B"}])
+    rid = r["id"]
+
+    bad_pos = locate(rid, 0.0, "1:9:0")  # 超出 4/4
+    assert bad_pos.status_code == 422
+    assert bad_pos.json()["detail"][0]["loc"] == ["body", "position"]
+
+    assert locate(rid, -0.5, "1:1:0").status_code == 422
+    for raw in ("NaN", "Infinity", "-Infinity"):
+        resp = client.post(
+            f"/rehearsals/{rid}/locate",
+            content=f'{{"elapsed_seconds": {raw}, "position": "1:1:0"}}',
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 422, raw
+
+    # 全部拒绝：起点与进度不变
+    got = client.get(f"/rehearsals/{rid}").json()
+    assert got["origin"]["total_ticks"] == 0
+    assert got["last_elapsed_seconds"] == 0.0
+    assert got["cues"][0]["status"] == "pending"
+
+
+def test_locate_unknown_rehearsal_is_404():
+    resp = locate("deadbeef", 0.0, "1:1:0")
+    assert resp.status_code == 404
+    assert resp.json()["detail"][0]["loc"] == ["path", "rehearsal_id"]
+
+
+# ---------------------------------------------------------------------- #
+# 定位 + 发布交错：发布只重算待发提示，不动起点/已发/跳过
+# ---------------------------------------------------------------------- #
+def test_publish_after_locate_retimes_pending_but_keeps_origin_and_skips():
+    score = create_score()
+    sid = score["id"]
+    r = create_rehearsal(
+        sid,
+        [
+            {"position": "2:1:0", "text": "B"},  # 已发 rev0 / 2.0s
+            {"position": "3:1:0", "text": "C"},  # 定位跳过
+            {"position": "5:1:0", "text": "E"},  # 待发
+        ],
+    )
+    rid = r["id"]
+    claim(rid, 2.0)
+    locate(rid, 2.0, "4:1:0")  # 起点 (4:1:0=6.0s, 累计 2.0s)
+
+    # 发布 60 BPM：全图秒数翻倍。起点位置变为 12.0s、E 变为 16.0s，
+    # 间距仍是 4.0s -> E 触发秒数 2.0+4.0 = 6.0（相对秒数不变的特例）；
+    # 为体现“按最新修订重算”，再定位一次制造非对齐间距：
+    pub = client.post(
+        f"/scores/{sid}/revisions/0/publish", json={"tempo_points": SLOW_POINTS}
+    )
+    assert pub.status_code == 200
+
+    got = client.get(f"/rehearsals/{rid}").json()
+    # 定位起点（tick + 提交秒数）不因发布而变
+    assert got["origin"] == {
+        "position": "4:1:0",
+        "total_ticks": 5760,
+        "elapsed_seconds": 2.0,
+    }
+    b, c, e = got["cues"]
+    assert b["status"] == "delivered" and b["revision"] == 0
+    assert math.isclose(b["trigger_seconds"], 2.0)
+    assert c["status"] == "skipped" and c["skipped_revision"] == 0
+    assert e["status"] == "pending"
+
+    # E 按 rev1 重新定时：16.0 - 12.0 = 4.0 间距 -> 触发 6.0
+    assert claim(rid, 5.999).json()["cues"] == []
+    late = claim(rid, 6.0).json()
+    assert [x["text"] for x in late["cues"]] == ["E"]
+    assert late["revision"] == 1
+    assert math.isclose(late["cues"][0]["trigger_seconds"], 6.0)
+
+
+def test_publish_after_locate_can_change_relative_trigger_seconds():
+    """非线性整比缩放时，发布后起点到提示的速度图时长会变。"""
+    sid = create_score()["id"]
+    # 提示：4:1:0（目标处）与 5:1:0；120 BPM 下一小节 2.0s
+    r = create_rehearsal(
+        sid,
+        [
+            {"position": "4:1:0", "text": "T"},
+            {"position": "5:1:0", "text": "E"},
+        ],
+    )
+    rid = r["id"]
+    locate(rid, 0.0, "4:1:0")  # 起点 (4:1:0, 0.0s)
+
+    # 自定义替换图：1:1:0 起 240 BPM（一小节 1.0s）。锁定锚点只有 1:1:0，
+    # 偏移 0，允许发布。
+    pub = client.post(
+        f"/scores/{sid}/revisions/0/publish", json={"tempo_points": FAST_POINTS}
+    )
+    assert pub.status_code == 200
+    # T 位于目标 tick -> 触发恒为 0.0（同秒可领）；E 在新图距起点 1.0s
+    # （旧图为 2.0s）-> 触发 1.0，体现“按最新修订重算”。
+    assert [x["text"] for x in claim(rid, 0.0).json()["cues"]] == ["T"]
+    assert claim(rid, 0.999).json()["cues"] == []
+    late = claim(rid, 1.0).json()
+    assert [x["text"] for x in late["cues"]] == ["E"]
+    assert math.isclose(late["cues"][0]["trigger_seconds"], 1.0)
+    assert late["cues"][0]["revision"] == 1
+
+
+# ---------------------------------------------------------------------- #
+# 定位/领取/发布交错：同一提示不能既跳过又发放
+# ---------------------------------------------------------------------- #
+def test_concurrent_locate_and_claim_never_skip_and_deliver_same_cue(fresh_db):
+    """多连接并发：一半在 4:1:0 定位（跳过之前的提示），一半领取到点。
+
+    定位与领取共用写锁串行化，每条提示最终状态只能是
+    delivered / skipped / pending 之一；跳过集合与发放集合不相交。
+    """
+    from app.db import OriginMismatch, Store
+    from app.main import _due_cues, _skip_before_target
+
+    score = create_score()
+    r = create_rehearsal(
+        score["id"],
+        [{"position": f"{m}:1:0", "text": f"cue{m}"} for m in range(2, 8)],
+    )
+    rid = r["id"]
+    db_path = fresh_db
+
+    n_workers = 8
+    stores = [Store(str(db_path)) for _ in range(n_workers)]
+    barrier = threading.Barrier(n_workers)
+    errors: list[Exception] = []
+    rejected: list[str] = []
+
+    def worker(i, store):
+        try:
+            barrier.wait(timeout=10)
+            if i % 2 == 0:
+                try:
+                    store.locate(rid, 0.0, 5760, _skip_before_target)  # 跳 4:1:0
+                except OriginMismatch:
+                    # 领取先到时进度变为 1000，定位秒数 0 必须被拒绝且状态不变
+                    rejected.append("locate")
+            else:
+                store.claim_cues(
+                    rid, 1000.0, lambda s, p: _due_cues(s, p, 1000.0)
+                )
+        except Exception as exc:  # pragma: no cover - 失败时下面断言暴露
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=worker, args=(i, s))
+        for i, s in enumerate(stores)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert not errors
+    # 若领取先提交，后续定位都应被 409 拒绝（秒数 0 != 进度 1000），
+    # 全部提示发放、没有跳过；若某个定位先到，则前两个提示跳过、其余发放。
+    import sqlite3
+
+    conn = sqlite3.connect(str(db_path))
+    delivered = {
+        row[0]
+        for row in conn.execute(
+            "SELECT cue_index FROM cue_deliveries WHERE rehearsal_id = ?", (rid,)
+        )
+    }
+    skipped = {
+        row[0]
+        for row in conn.execute(
+            "SELECT cue_index FROM cue_skips WHERE rehearsal_id = ?", (rid,)
+        )
+    }
+    origin = conn.execute(
+        "SELECT origin_ticks, origin_elapsed FROM rehearsals WHERE id = ?", (rid,)
+    ).fetchone()
+    conn.close()
+    assert not (delivered & skipped)
+    if skipped:
+        # 定位先到：目标之前的提示（2:1:0、3:1:0）跳过，其余发放，起点已更新
+        assert skipped == {0, 1}
+        assert origin == (5760, 0.0)
+    else:
+        # 领取先到：所有定位都被 409 拒绝，起点保持 (0, 0.0)
+        assert rejected
+        assert origin == (0, 0.0)
+    assert delivered | skipped == set(range(6))
+
+
+# ---------------------------------------------------------------------- #
+# 持久化：定位起点与跳过状态重启后保留，可继续领取
+# ---------------------------------------------------------------------- #
+def test_locate_state_survives_store_restart(fresh_db, monkeypatch):
+    db_path = fresh_db
+    score = create_score()
+    r = create_rehearsal(
+        score["id"],
+        [
+            {"position": "2:1:0", "text": "B"},
+            {"position": "3:1:0", "text": "C"},
+            {"position": "5:1:0", "text": "E"},
+        ],
+    )
+    rid = r["id"]
+    claim(rid, 2.0)
+    locate(rid, 2.0, "4:1:0")  # C 跳过，起点 (4:1:0, 2.0)
+
+    import app.main as main
+    from app.db import Store
+
+    monkeypatch.setattr(main, "store", Store(str(db_path)))
+
+    got = client.get(f"/rehearsals/{rid}").json()
+    assert got["origin"]["position"] == "4:1:0"
+    assert got["origin"]["elapsed_seconds"] == 2.0
+    assert [c["status"] for c in got["cues"]] == [
+        "delivered",
+        "skipped",
+        "pending",
+    ]
+    # C 不会因重启恢复；E 仍按定位后的相对秒数（2.0 + 2.0 = 4.0）领取
+    late = claim(rid, 4.0).json()
+    assert [c["text"] for c in late["cues"]] == ["E"]
+    assert math.isclose(late["cues"][0]["trigger_seconds"], 4.0)
+
+    after = client.get(f"/rehearsals/{rid}").json()
+    assert {c["text"]: c["status"] for c in after["cues"]} == {
+        "B": "delivered",
+        "C": "skipped",
+        "E": "delivered",
+    }
+
+
+
+# ---------------------------------------------------------------------- #
+# 旧版库迁移：无定位起点列/无 cue_skips 表的库打开后自动升级，
+# 旧排练仍按绝对秒数计时
+# ---------------------------------------------------------------------- #
+def test_old_schema_db_is_migrated_and_keeps_absolute_timing(tmp_path):
+    db_path = tmp_path / "old.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE scores (id TEXT PRIMARY KEY, ppq INTEGER NOT NULL,
+            time_signatures TEXT NOT NULL, tempo_points TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')));
+        CREATE TABLE anchors (score_id TEXT NOT NULL, position_index INTEGER NOT NULL,
+            position TEXT NOT NULL, locked INTEGER NOT NULL, total_ticks INTEGER NOT NULL,
+            original_seconds REAL NOT NULL, current_seconds REAL NOT NULL,
+            tick_seconds REAL NOT NULL, PRIMARY KEY (score_id, position_index));
+        CREATE TABLE rehearsals (id TEXT PRIMARY KEY, score_id TEXT NOT NULL,
+            last_elapsed REAL NOT NULL DEFAULT 0.0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')));
+        CREATE TABLE rehearsal_cues (rehearsal_id TEXT NOT NULL, cue_index INTEGER NOT NULL,
+            position TEXT NOT NULL, text TEXT NOT NULL, total_ticks INTEGER NOT NULL,
+            PRIMARY KEY (rehearsal_id, cue_index));
+        CREATE TABLE cue_deliveries (rehearsal_id TEXT NOT NULL, cue_index INTEGER NOT NULL,
+            trigger_seconds REAL NOT NULL, revision INTEGER NOT NULL,
+            elapsed_seconds REAL NOT NULL,
+            delivered_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (rehearsal_id, cue_index));
+        """
+    )
+    points = json.dumps(
+        [{"position": "1:1:0", "bpm": 120, "curve": "step"}], ensure_ascii=False
+    )
+    conn.execute(
+        "INSERT INTO scores VALUES ('s1', 480, '[]', ?, 0, datetime('now'))",
+        (points,),
+    )
+    conn.execute(
+        "INSERT INTO anchors VALUES ('s1', 0, '1:1:0', 1, 0, 0.0, 0.0, 0.001)"
+    )
+    conn.execute(
+        "INSERT INTO rehearsals (id, score_id, last_elapsed) VALUES ('r1','s1', 2.0)"
+    )
+    conn.execute("INSERT INTO rehearsal_cues VALUES ('r1', 0, '2:1:0', 'B', 1920)")
+    conn.execute("INSERT INTO rehearsal_cues VALUES ('r1', 1, '3:1:0', 'C', 3840)")
+    conn.execute(
+        "INSERT INTO cue_deliveries VALUES ('r1', 0, 2.0, 0, 2.0, datetime('now'))"
+    )
+    conn.commit()
+    conn.close()
+
+    from app.db import Store
+    from app.main import _due_cues
+
+    # 打开旧库：自动补 origin_ticks / origin_elapsed 列与 cue_skips 表
+    store = Store(str(db_path))
+    got = store.get_rehearsal("r1")
+    assert got["origin_ticks"] == 0
+    assert got["origin_elapsed_seconds"] == 0.0
+    assert [c["status"] for c in got["cues"]] == ["delivered", "pending"]
+
+    # 旧排练未定位：C 仍按全图绝对秒数 4.0 触发
+    out = store.claim_cues("r1", 4.0, lambda s, p: _due_cues(s, p, 4.0))
+    assert [(c["index"], c["trigger_seconds"]) for c in out["cues"]] == [(1, 4.0)]

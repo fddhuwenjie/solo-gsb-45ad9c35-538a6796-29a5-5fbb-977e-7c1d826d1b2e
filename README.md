@@ -14,7 +14,13 @@
 领取到点提示；每次领取按谱例**当前已提交的速度图**给未发提示定时，
 返回提示文字、位置、触发秒数与所用修订号；**进度只前进**（重复领取
 不重发、倒退 **409**），发布后**已发提示不撤回、未发提示按新修订
-重新定时**；排练与发放记录同样保存在 SQLite，重启后可继续领取。
+重新定时**；排练中途可**定位（跳转）**到另一乐谱位置：提交当前已
+领取的累计秒数（必须与进度精确相等，否则 **409** 且状态不变）与目标
+`小节:拍:tick`，尚未发放且位于目标之前的提示记为**跳过**（目标处
+提示可在同一秒领取，回跳不重发、不恢复），此后提示按“提交秒数 +
+目标到提示的速度图时长”定时；发布后待发提示按最新修订重新计时，
+而已发记录、跳过状态与定位起点不变。排练、发放与跳过记录同样保存在
+SQLite，重启后可继续领取。
 
 - 位置中的“拍”按**当前拍号分母**对应的音符计（6/8 中一拍 = 八分音符）；
 - 内部统一展开为“距乐谱起点的 **tick 坐标**”（PPQ：每四分音符的 tick 数）；
@@ -32,7 +38,7 @@
 - [本地直接运行](#本地直接运行)
 - [接口地址与交互式文档](#接口地址与交互式文档)
 - [录音锚点修订：创建 / 预览 / 发布](#录音锚点修订创建--预览--发布)
-- [排练提示：创建排练 / 领取到点提示](#排练提示创建排练--领取到点提示)
+- [排练提示：创建排练 / 领取到点提示 / 定位跳转](#排练提示创建排练--领取到点提示)
 - [约定与规则](#约定与规则)
 - [请求字段](#请求字段)
 - [响应字段](#响应字段)
@@ -62,6 +68,7 @@ docker compose up --build
 - 查询谱例：`GET  http://localhost:8000/scores/{id}`
 - 创建排练：`POST http://localhost:8000/rehearsals`
 - 领取到点提示：`POST http://localhost:8000/rehearsals/{id}/claims`
+- 定位（跳转）：`POST http://localhost:8000/rehearsals/{id}/locate`
 - 查询排练：`GET  http://localhost:8000/rehearsals/{id}`
 - Swagger 交互文档：<http://localhost:8000/docs>
 - ReDoc：<http://localhost:8000/redoc>
@@ -131,10 +138,14 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ### HTTP 调用示例
 
+> 下列示例直接从**实际返回的 JSON 中提取 ID**（需要 `python3`；
+> 也可用 `jq -r .id`），按顺序粘贴即可在全新服务上完整跑通；
+> 响应里的 ID 每次都不同，示例 JSON 中的 ID 仅为某次实际运行的返回值。
+
 #### 1）创建谱例（返回 ID 与修订号 0）
 
 ```bash
-curl -s -X POST http://localhost:8000/scores \
+SID=$(curl -s -X POST http://localhost:8000/scores \
   -H 'Content-Type: application/json' \
   -d '{
     "ppq": 480,
@@ -146,7 +157,8 @@ curl -s -X POST http://localhost:8000/scores \
       {"position": "1:1:0", "locked": true},
       {"position": "2:1:0", "locked": false}
     ]
-  }'
+  }' | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])')
+echo "谱例 ID：$SID"
 ```
 
 120 BPM、PPQ=480 下一拍 0.5 s、一 tick `0.5/480` s；`2:1:0` 即一小节
@@ -174,7 +186,6 @@ curl -s -X POST http://localhost:8000/scores \
 把整体速度放慢到 60 BPM（`2:1:0` 由 2.0 s 变 4.0 s）：
 
 ```bash
-SID=ac0224ce71d34c90bbe6f3a917602bbe
 curl -s -X POST http://localhost:8000/scores/$SID/revisions/0/preview \
   -H 'Content-Type: application/json' \
   -d '{
@@ -310,62 +321,96 @@ curl -s http://localhost:8000/scores/$SID
    **新修订**重新定时。领取的读-算-写在同一事务内完成，与发布交错时
    二者必居其一，**计算到点所用的修订必然等于写入发放记录的修订**；
    并发领取被串行化，同一提示**最多发放一次**（发放记录主键兜底）。
-5. **查询** `GET /rehearsals/{id}`：返回已领取进度与每条提示的发放
-   状态（`delivered` / `trigger_seconds` / `revision`）。
-6. 排练与发放记录保存在 **SQLite**（`rehearsals` / `rehearsal_cues` /
-   `cue_deliveries` 表，与谱例同库同卷），Compose 重启后可继续领取。
+5. **定位（跳转）** `POST /rehearsals/{id}/locate`：排练中途跳到另一
+   乐谱位置时提交当前**已领取的累计秒数** `elapsed_seconds` 与目标
+   `position`（`小节:拍:tick`，按谱例 PPQ/拍号校验）。
+   - 提交秒数必须与当前已领取进度**精确相等**，否则返回 **409**
+     （响应体含 `elapsed_seconds` / `last_elapsed_seconds`），计时起点、
+     跳过与发放状态**一律不变**；
+   - 尚未发放且 tick **严格位于目标之前**的提示记为**跳过**
+     （记录定位时的修订号）；tick 等于目标（目标处）的提示**不跳过**，
+     触发秒数恰为提交秒数，**可在同一秒领取**；
+   - 每次定位以（提交秒数, 目标 tick）更新**计时起点**；后续提示的
+     触发秒数 = `提交秒数 + 速度图上目标位置到提示位置的时长`
+     （线性段同样按解析积分计）。未做过定位的排练起点是
+     `1:1:0 / 0.0s`，触发秒数即全图绝对秒数，保持原有计时；
+   - **回跳不重发**已发提示，也**不恢复**已跳过提示；回跳后已位于
+     目标之前的待发提示（若有）同样记为跳过；
+   - 定位的读-判-写在**单个写事务**内完成，与领取、发布共用写锁
+     串行化：同一条提示不可能既跳过又发放，跳过记录的修订必然是
+     定位瞬间谱例的当前修订。
+6. **发布与定位的关系**：速度图发布后，**待发提示按最新已提交修订
+   重新计时**（起点 tick 到提示 tick 的速度图时长随新图变化）；
+   **已发记录、跳过状态与定位起点（tick/提交秒数）都不变**。
+7. **查询** `GET /rehearsals/{id}`：返回已领取进度、当前计时起点
+   `origin`（位置/tick/累计秒数）与每条提示的状态
+   `status`（`pending` 待发 / `delivered` 已发 / `skipped` 跳过；
+   同时保留兼容字段 `delivered`、已发提示的 `trigger_seconds` /
+   `revision`，以及跳过提示的 `skipped_revision`）。
+8. 排练、提示、发放与跳过记录保存在 **SQLite**（`rehearsals` /
+   `rehearsal_cues` / `cue_deliveries` / `cue_skips` 表，与谱例同库同卷；
+   旧库打开时自动补定位起点列），Compose 重启后可继续领取。
 
 ### HTTP 调用示例
 
 以下沿用上文创建的谱例（`$SID`，120 BPM、4/4、PPQ=480：一拍 0.5 s、
 一小节 2.0 s）。
 
-#### 1）创建排练（返回排练 ID）
+#### 1）创建排练（从返回中取出排练 ID）
 
 ```bash
-curl -s -X POST http://localhost:8000/rehearsals \
+RID=$(curl -s -X POST http://localhost:8000/rehearsals \
   -H 'Content-Type: application/json' \
   -d '{
     "score_id": "'$SID'",
     "cues": [
       {"position": "2:1:0", "text": "进副歌"},
-      {"position": "3:1:0", "text": "渐慢准备"}
+      {"position": "3:1:0", "text": "渐慢准备"},
+      {"position": "5:1:0", "text": "收尾"}
     ]
-  }'
+  }' | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])')
+echo "排练 ID：$RID"
 ```
+
+创建响应（ID 为实际返回值，此处用占位符表示）：
 
 ```json
 {
-  "id": "7c9e1b2f4a5d4e8f9c0a1b2c3d4e5f6a",
-  "score_id": "ac0224ce71d34c90bbe6f3a917602bbe",
+  "id": "<排练 ID>",
+  "score_id": "<谱例 ID>",
   "last_elapsed_seconds": 0.0,
+  "origin": {"position": "1:1:0", "total_ticks": 0, "elapsed_seconds": 0.0},
   "cues": [
     {"index": 0, "position": "2:1:0", "text": "进副歌", "total_ticks": 1920,
-     "delivered": false, "trigger_seconds": null, "revision": null},
+     "status": "pending", "delivered": false,
+     "trigger_seconds": null, "revision": null, "skipped_revision": null},
     {"index": 1, "position": "3:1:0", "text": "渐慢准备", "total_ticks": 3840,
-     "delivered": false, "trigger_seconds": null, "revision": null}
+     "status": "pending", "delivered": false,
+     "trigger_seconds": null, "revision": null, "skipped_revision": null},
+    {"index": 2, "position": "5:1:0", "text": "收尾", "total_ticks": 7680,
+     "status": "pending", "delivered": false,
+     "trigger_seconds": null, "revision": null, "skipped_revision": null}
   ]
 }
 ```
 
 位置非法（如 `1:9:0` 超出 4/4 拍数）或文字为空时返回带 `index` 的 422。
 
-#### 2）排练进行到 2.5 s：领取到点提示
+#### 2）排练进行到 2.0 s：领取到点提示
 
 ```bash
-RID=7c9e1b2f4a5d4e8f9c0a1b2c3d4e5f6a
 curl -s -X POST http://localhost:8000/rehearsals/$RID/claims \
   -H 'Content-Type: application/json' \
-  -d '{"elapsed_seconds": 2.5}'
+  -d '{"elapsed_seconds": 2.0}'
 ```
 
-`2:1:0` 在 120 BPM 下触发于 2.0 s（已到点），`3:1:0` 触发于 4.0 s
-（未到点）：
+`2:1:0` 在 120 BPM 下触发于 2.0 s（已到点），`3:1:0` 触发于 4.0 s、
+`5:1:0` 触发于 8.0 s（均未到点）：
 
 ```json
 {
-  "id": "7c9e1b2f4a5d4e8f9c0a1b2c3d4e5f6a",
-  "elapsed_seconds": 2.5,
+  "id": "<排练 ID>",
+  "elapsed_seconds": 2.0,
   "revision": 0,
   "cues": [
     {"index": 0, "position": "2:1:0", "text": "进副歌",
@@ -374,82 +419,173 @@ curl -s -X POST http://localhost:8000/rehearsals/$RID/claims \
 }
 ```
 
-#### 3）重复领取与倒退
+#### 3）定位（跳转）到 4:1:0：跳过之前的提示，重置计时起点
 
-同一时刻（或进度内）重复领取不会重发已发提示：
+排练中途跳到 `4:1:0`（绝对 6.0 s 处），提交的累计秒数必须等于当前
+已领取进度 2.0 s：
+
+```bash
+curl -s -X POST http://localhost:8000/rehearsals/$RID/locate \
+  -H 'Content-Type: application/json' \
+  -d '{"elapsed_seconds": 2.0, "position": "4:1:0"}'
+```
+
+待发且位于目标之前的“渐慢准备”（4.0 s < 6.0 s）记为**跳过**；
+“收尾”在目标之后（绝对 8.0 s，距目标 2.0 s）保持待发，触发秒数
+改为 `2.0 + 2.0 = 4.0` s：
+
+```json
+{
+  "id": "<排练 ID>",
+  "elapsed_seconds": 2.0,
+  "revision": 0,
+  "origin": {"position": "4:1:0", "total_ticks": 5760,
+             "elapsed_seconds": 2.0},
+  "skipped": [
+    {"index": 1, "position": "3:1:0", "text": "渐慢准备",
+     "total_ticks": 3840, "revision": 0}
+  ],
+  "cues": [
+    {"index": 0, "position": "2:1:0", "text": "进副歌", "total_ticks": 1920,
+     "status": "delivered", "delivered": true,
+     "trigger_seconds": 2.0, "revision": 0, "skipped_revision": null},
+    {"index": 1, "position": "3:1:0", "text": "渐慢准备", "total_ticks": 3840,
+     "status": "skipped", "delivered": false,
+     "trigger_seconds": null, "revision": null, "skipped_revision": 0},
+    {"index": 2, "position": "5:1:0", "text": "收尾", "total_ticks": 7680,
+     "status": "pending", "delivered": false,
+     "trigger_seconds": null, "revision": null, "skipped_revision": null}
+  ]
+}
+```
+
+定位秒数不等于当前进度（或倒退领取）返回 **409** 且状态不变：
+
+```bash
+curl -i -X POST http://localhost:8000/rehearsals/$RID/locate \
+  -H 'Content-Type: application/json' \
+  -d '{"elapsed_seconds": 3.0, "position": "4:1:0"}'
+# HTTP/1.1 409 Conflict
+# {"detail": [{"loc": ["body", "elapsed_seconds"],
+#   "msg": "定位秒数必须等于当前已领取进度：本次 3.0s，已领取进度 2.0s",
+#   "index": null, "elapsed_seconds": 3.0, "last_elapsed_seconds": 2.0}]}
+```
+
+目标位置非法（如 `1:9:0`）或秒数为负/非有限值返回 **422**。
+
+#### 4）定位后继续领取：按“提交秒数 + 目标到提示时长”触发
+
+同一秒（2.0 s）重复领取不发任何东西（没有位于目标 tick 上的提示）；
+“收尾”在新计时下触发于 4.0 s：
 
 ```bash
 curl -s -X POST http://localhost:8000/rehearsals/$RID/claims \
   -H 'Content-Type: application/json' \
-  -d '{"elapsed_seconds": 2.5}'
-# {"id": "...", "elapsed_seconds": 2.5, "revision": 0, "cues": []}
-```
+  -d '{"elapsed_seconds": 2.0}'
+# {"id": "...", "elapsed_seconds": 2.0, "revision": 0, "cues": []}
 
-倒退请求返回 **409** 且状态不变：
-
-```bash
-curl -i -X POST http://localhost:8000/rehearsals/$RID/claims \
+curl -s -X POST http://localhost:8000/rehearsals/$RID/claims \
   -H 'Content-Type: application/json' \
-  -d '{"elapsed_seconds": 1.0}'
-# HTTP/1.1 409 Conflict
-# {"detail": [{"loc": ["body", "elapsed_seconds"],
-#   "msg": "领取进度只能前进：本次 1.0s 早于已领取进度 2.5s",
-#   "index": null, "elapsed_seconds": 1.0, "last_elapsed_seconds": 2.5}]}
+  -d '{"elapsed_seconds": 4.0}'
 ```
 
-#### 4）发布新速度图：未发提示按新修订重新定时
+```json
+{
+  "id": "<排练 ID>",
+  "elapsed_seconds": 4.0,
+  "revision": 0,
+  "cues": [
+    {"index": 2, "position": "5:1:0", "text": "收尾",
+     "trigger_seconds": 4.0, "revision": 0}
+  ]
+}
+```
 
-把整体速度放慢到 60 BPM（触发秒数翻倍）：
+回跳（如再定位回 `2:1:0`）**不重发**已发的“进副歌/收尾”，也**不
+恢复**已跳过的“渐慢准备”。
+
+#### 5）发布新速度图：待发提示按新修订重新定时，起点与跳过不变
+
+另建一个排练（`2:1:0` 先领、定位到 `4:1:0`、`5:1:0` 待发），随后
+把整体速度放慢到 60 BPM（谱例修订 0 → 1）：
 
 ```bash
+RID2=$(curl -s -X POST http://localhost:8000/rehearsals \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "score_id": "'$SID'",
+    "cues": [
+      {"position": "2:1:0", "text": "进副歌"},
+      {"position": "3:1:0", "text": "渐慢准备"},
+      {"position": "5:1:0", "text": "收尾"}
+    ]
+  }' | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])')
+curl -s -X POST http://localhost:8000/rehearsals/$RID2/claims \
+  -H 'Content-Type: application/json' \
+  -d '{"elapsed_seconds": 2.0}' > /dev/null
+curl -s -X POST http://localhost:8000/rehearsals/$RID2/locate \
+  -H 'Content-Type: application/json' \
+  -d '{"elapsed_seconds": 2.0, "position": "4:1:0"}' > /dev/null
+
 curl -s -X POST http://localhost:8000/scores/$SID/revisions/0/publish \
   -H 'Content-Type: application/json' \
   -d '{"tempo_points": [{"position": "1:1:0", "bpm": 60, "curve": "step"}]}'
 ```
 
-已发的“进副歌”（2.0 s，rev0）**不撤回、不重发**；未发的“渐慢准备”
-在新图下重新定时为 8.0 s——排练进行到 8.0 s 时领取：
+定位起点仍是 `4:1:0 / 2.0 s`、已发与跳过状态不变；60 BPM 下
+`4:1:0`→`5:1:0` 的一小节时长变为 4.0 s，故“收尾”重新定时为
+`2.0 + 4.0 = 6.0` s，在 6.0 s 领取（发放记录为 rev1）：
 
 ```bash
-curl -s -X POST http://localhost:8000/rehearsals/$RID/claims \
+curl -s -X POST http://localhost:8000/rehearsals/$RID2/claims \
   -H 'Content-Type: application/json' \
-  -d '{"elapsed_seconds": 8.0}'
+  -d '{"elapsed_seconds": 6.0}'
 ```
 
 ```json
 {
-  "id": "7c9e1b2f4a5d4e8f9c0a1b2c3d4e5f6a",
-  "elapsed_seconds": 8.0,
+  "id": "<排练 ID>",
+  "elapsed_seconds": 6.0,
   "revision": 1,
   "cues": [
-    {"index": 1, "position": "3:1:0", "text": "渐慢准备",
-     "trigger_seconds": 8.0, "revision": 1}
+    {"index": 2, "position": "5:1:0", "text": "收尾",
+     "trigger_seconds": 6.0, "revision": 1}
   ]
 }
 ```
 
-#### 5）查询排练状态
+#### 6）查询排练：待发 / 已发 / 跳过可区分
 
 ```bash
-curl -s http://localhost:8000/rehearsals/$RID
+curl -s http://localhost:8000/rehearsals/$RID2
 ```
 
 ```json
 {
-  "id": "7c9e1b2f4a5d4e8f9c0a1b2c3d4e5f6a",
-  "score_id": "ac0224ce71d34c90bbe6f3a917602bbe",
-  "last_elapsed_seconds": 8.0,
+  "id": "<排练 ID>",
+  "score_id": "<谱例 ID>",
+  "last_elapsed_seconds": 6.0,
+  "origin": {"position": "4:1:0", "total_ticks": 5760,
+             "elapsed_seconds": 2.0},
   "cues": [
     {"index": 0, "position": "2:1:0", "text": "进副歌", "total_ticks": 1920,
-     "delivered": true, "trigger_seconds": 2.0, "revision": 0},
+     "status": "delivered", "delivered": true,
+     "trigger_seconds": 2.0, "revision": 0, "skipped_revision": null},
     {"index": 1, "position": "3:1:0", "text": "渐慢准备", "total_ticks": 3840,
-     "delivered": true, "trigger_seconds": 8.0, "revision": 1}
+     "status": "skipped", "delivered": false,
+     "trigger_seconds": null, "revision": null, "skipped_revision": 0},
+    {"index": 2, "position": "5:1:0", "text": "收尾", "total_ticks": 7680,
+     "status": "delivered", "delivered": true,
+     "trigger_seconds": 6.0, "revision": 1, "skipped_revision": null}
   ]
 }
 ```
 
 注意“进副歌”的发放记录保持发放时的修订与触发秒数（rev0 / 2.0 s），
-即使速度图已切换到 60 BPM——已发提示不随发布改变。
+即使速度图已切换到 60 BPM——已发提示不随发布改变；“渐慢准备”的
+跳过状态与 `skipped_revision`（定位时 rev0）同样不受发布影响；
+定位起点 `origin`（4:1:0 / 2.0 s）也保持定位提交时的值，发布只让
+待发提示按新修订重新计算“起点到提示”的时长。
 
 ---
 
@@ -743,7 +879,7 @@ BPM=0、速度点位置重复、拍号分母不是 2 的幂，会在同一个 42
 
 排练接口还可能返回：
 
-- **404**：谱例 ID（创建排练时）或排练 ID（领取/查询时）不存在，
+- **404**：谱例 ID（创建排练时）或排练 ID（领取/定位/查询时）不存在，
   `detail[0].loc` 分别指向 `path.score_id` / `path.rehearsal_id`；
 - **409**：领取秒数早于已领取进度（倒退），状态不变：
 
@@ -754,8 +890,19 @@ BPM=0、速度点位置重复、拍号分母不是 2 的幂，会在同一个 42
                "elapsed_seconds": 1.0, "last_elapsed_seconds": 2.5}]}
   ```
 
+  定位提交秒数不等于当前已领取进度同样返回 **409**（计时起点、跳过与
+  发放状态均不变）：
+
+  ```json
+  {"detail": [{"loc": ["body", "elapsed_seconds"],
+               "msg": "定位秒数必须等于当前已领取进度：本次 3.0s，已领取进度 2.0s",
+               "index": null,
+               "elapsed_seconds": 3.0, "last_elapsed_seconds": 2.0}]}
+  ```
+
 - **422**：提示位置非法或文字为空（带提示 `index`）、`elapsed_seconds`
-  为负或非有限值、提示表为空。
+  为负或非有限值、提示表为空；定位目标 `position` 非法（按谱例 PPQ/
+  拍号校验）或定位秒数为负/非有限值。
 
 ---
 
@@ -785,7 +932,15 @@ Simpson 数值积分交叉校验，误差 ~1e-14）、同段反求与边界归�
 不变、发布后已发不撤回而未发按新修订重新定时（发放记录修订与计算所用
 修订一致）、同刻补发被提前的未发提示、**多连接并发领取同一提示最多
 发放一次**，以及新 Store 实例（模拟 Compose 重启）后进度保留、可继续
-领取。
+领取。定位相关测试覆盖：目标之前待发提示记为跳过而目标处提示同秒可领、
+定位后触发秒数 = 提交秒数 + 目标到提示的速度图时长（含线性段与阶梯段）、
+未定位排练保持原绝对计时、前跳/直接跳转重标待发提示、回跳不重发也不
+恢复、提交秒数不等于进度 409 且状态不变、目标位置/秒数非法 422、
+发布后待发提示按新修订重算而定位起点/已发/跳过不变、**多连接定位与
+领取交错时同一提示不会既跳过又发放（且落后的定位 409 不改状态）**、
+查询可区分 pending/delivered/skipped，以及定位起点与跳过状态重启后
+保留、可继续领取；另含旧版 SQLite 库（无定位起点列）打开时自动迁移、
+旧排练仍按绝对秒数计时的验证。
 
 ## 项目结构
 
@@ -796,13 +951,13 @@ Simpson 数值积分交叉校验，误差 ~1e-14）、同段反求与边界归�
 │   ├── main.py        # FastAPI 路由、请求/响应模型、422/409/404 错误处理
 │   ├── tempo.py       # 核心引擎：拍号展开、积分换算、同段求逆、校验
 │   └── db.py          # SQLite 持久化：谱例/锚点/修订号乐观锁原子发布，
-│                      #   排练/提示/发放记录单事务领取
+│                      #   排练/提示/发放/跳过记录，单事务领取与定位
 ├── tests/
 │   ├── conftest.py    # 测试用临时 SQLite（TEMPO_DB_PATH）
 │   ├── test_tempo.py  # 引擎数值/往返/校验测试
 │   ├── test_api.py    # /convert 端到端测试
 │   ├── test_scores.py # 修订创建/预览/发布/查询与持久化测试
-│   └── test_rehearsals.py # 排练创建/领取/进度/并发与持久化测试
+│   └── test_rehearsals.py # 排练创建/领取/定位跳过/并发与持久化测试
 ├── Dockerfile
 ├── docker-compose.yml # 命名卷 tempo-data -> /data（TEMPO_DB_PATH）
 ├── requirements.txt
